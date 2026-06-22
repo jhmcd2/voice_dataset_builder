@@ -1,7 +1,12 @@
 import os
-import random
+import sys
+import json
 import csv
+import time
+import random
+import soundfile as sf
 from collections import defaultdict
+
 from indextts.infer_v2 import IndexTTS2
 
 # =========================
@@ -9,9 +14,17 @@ from indextts.infer_v2 import IndexTTS2
 # =========================
 
 RAVDESS_DIR = "ravdess/"
-VOICE_WAV = "my_voice.wav"
-OUTPUT_DIR = "indextts_dataset/"
-METADATA_CSV = os.path.join(OUTPUT_DIR, "metadata.csv")
+VOICE_WAV = None
+
+OUTPUT_DIR = "indextts_dataset"
+AUDIO_DIR = os.path.join(OUTPUT_DIR, "audio")
+
+MANIFEST_PATH = os.path.join(OUTPUT_DIR, "manifest.json")
+METADATA_PATH = os.path.join(OUTPUT_DIR, "metadata.csv")
+FAILED_PATH = os.path.join(OUTPUT_DIR, "failed_jobs.json")
+
+MAX_RETRIES = 3
+TARGET_PER_EMOTION = 40
 
 TEXTS = [
     "Hello, how are you today?",
@@ -33,6 +46,7 @@ EMOTION_MAP = {
     "08": "surprised"
 }
 
+    
 # =========================
 # INIT MODEL
 # =========================
@@ -45,10 +59,10 @@ tts = IndexTTS2(
 )
 
 # =========================
-# PARSE RAVDESS
+# UTILITIES
 # =========================
 
-def parse_file(fname):
+def parse_ravdess(fname):
     parts = fname.replace(".wav", "").split("-")
     return {
         "emotion_id": parts[2],
@@ -58,20 +72,12 @@ def parse_file(fname):
         "path": os.path.join(RAVDESS_DIR, fname)
     }
 
-# =========================
-# LOAD DATASET
-# =========================
-
-def load_ravdess():
+def load_dataset():
     data = []
     for f in os.listdir(RAVDESS_DIR):
         if f.endswith(".wav"):
-            data.append(parse_file(f))
+            data.append(parse_ravdess(f))
     return data
-
-# =========================
-# GROUP BY EMOTION
-# =========================
 
 def group_by_emotion(data):
     groups = defaultdict(list)
@@ -79,78 +85,174 @@ def group_by_emotion(data):
         groups[item["emotion"]].append(item)
     return groups
 
+def validate_wav(path):
+    try:
+        audio, sr = sf.read(path)
+        if len(audio) == 0:
+            return False
+        if abs(audio).max() < 1e-5:
+            return False
+        return True
+    except:
+        return False
+
+def already_done(path):
+    return os.path.exists(path) and validate_wav(path)
+
 # =========================
-# BALANCED SAMPLER
+# BALANCED SAMPLING
 # =========================
 
-def sample_balanced(groups, target_per_emotion=40):
-    sampled = []
+def build_jobs(groups):
+    jobs = []
 
     for emotion, items in groups.items():
         random.shuffle(items)
-        sampled.extend(items[:target_per_emotion])
 
-    return sampled
+        # actor-aware spread
+        actor_map = defaultdict(list)
+        for x in items:
+            actor_map[x["actor"]].append(x)
+
+        actors = list(actor_map.keys())
+        random.shuffle(actors)
+
+        selected = []
+
+        # round-robin actor sampling
+        while len(selected) < TARGET_PER_EMOTION:
+            for a in actors:
+                if actor_map[a]:
+                    selected.append(actor_map[a].pop())
+                if len(selected) >= TARGET_PER_EMOTION:
+                    break
+
+        for item in selected:
+            jobs.append({
+                "emotion": item["emotion"],
+                "intensity": item["intensity"],
+                "actor": item["actor"],
+                "emotion_ref": item["path"],
+                "text": random.choice(TEXTS)
+            })
+
+    return jobs
 
 # =========================
-# MAIN PIPELINE
+# PIPELINE
 # =========================
 
-def run_pipeline():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def run(VOICE_WAV):
+    os.makedirs(AUDIO_DIR, exist_ok=True)
 
-    dataset = load_ravdess()
-    groups = group_by_emotion(dataset)
+    data = load_dataset()
+    groups = group_by_emotion(data)
+    jobs = build_jobs(groups)
 
-    sampled = sample_balanced(groups, target_per_emotion=40)
+    failed = []
 
-    print(f"Total samples selected: {len(sampled)}")
-
-    # CSV logging
-    with open(METADATA_CSV, "w", newline="") as f:
+    # CSV metadata
+    with open(METADATA_PATH, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "output_file",
+            "output",
             "emotion",
             "intensity",
             "actor",
             "emotion_ref",
-            "text"
+            "text",
+            "status",
+            "retries"
         ])
 
-        for i, item in enumerate(sampled):
+        start_time = time.time()
 
-            text = random.choice(TEXTS)
-            output_path = os.path.join(OUTPUT_DIR, f"sample_{i:04d}.wav")
+        for i, job in enumerate(jobs):
 
-            print(f"[{i}] {item['emotion']} | actor {item['actor']}")
+            output_path = os.path.join(AUDIO_DIR, f"sample_{i:05d}.wav")
 
-            # =========================
-            # INDEXTTS2 INFERENCE
-            # =========================
-            tts.infer(
-                spk_audio_prompt=VOICE_WAV,
-                emo_audio_prompt=item["path"],
-                text=text,
-                output_path=output_path,
-                verbose=False
-            )
+            if already_done(output_path):
+                print(f"[SKIP] {output_path}")
+                continue
 
-            # log metadata
+            print(f"[{i}/{len(jobs)}] {job['emotion']} | actor {job['actor']}")
+
+            success = False
+            retries = 0
+
+            for attempt in range(MAX_RETRIES):
+
+                try:
+                    tts.infer(
+                        spk_audio_prompt=VOICE_WAV,
+                        emo_audio_prompt=job["emotion_ref"],
+                        text=job["text"],
+                        output_path=output_path,
+                        verbose=False
+                    )
+
+                    if validate_wav(output_path):
+                        success = True
+                        break
+
+                except Exception as e:
+                    print(f"Retry {attempt+1} failed: {e}")
+
+                retries += 1
+
+            if not success:
+                failed.append(job)
+
             writer.writerow([
                 output_path,
-                item["emotion"],
-                item["intensity"],
-                item["actor"],
-                item["path"],
-                text
+                job["emotion"],
+                job["intensity"],
+                job["actor"],
+                job["emotion_ref"],
+                job["text"],
+                "ok" if success else "failed",
+                retries
             ])
 
-    print("\nDONE: Dataset generated successfully.")
+            # ETA
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed
+            remaining = len(jobs) - (i + 1)
+            eta = remaining / rate if rate > 0 else 0
+
+            print(f"ETA: {eta/60:.1f} min")
+
+    # Save failures
+    with open(FAILED_PATH, "w") as f:
+        json.dump(failed, f, indent=2)
+
+    print("\nDONE")
+    print(f"Total jobs: {len(jobs)}")
+    print(f"Failed: {len(failed)}")
 
 # =========================
 # RUN
 # =========================
 
 if __name__ == "__main__":
-    run_pipeline()
+    # =========================
+    # Injest File
+    # =========================
+    
+    # Ensure the user provided the file argument
+    if len(sys.argv) < 2:
+        print("Error: Please provide a voice to modify.")
+        print("Usage: voice_data_set_builder.py <filename>")
+        sys.exit(1)
+    
+    filename = sys.argv[1]
+    
+    # Read and process the file
+    try:
+        with open(filename, 'r') as file:
+            VOICE_WAV = file.read()
+            print(f"Successfully ingested {filename}!")
+            run(VOICE_WAV)
+    except FileNotFoundError:
+        print(f"Error: The file '{filename}' was not found.")
+    
