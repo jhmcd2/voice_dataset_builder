@@ -17,3 +17,21 @@ indextts_dataset/
     sample_0001.wav
     ...
     metadata.csv
+## 5. Full dataset coverage
+all RAVDESS emotions
+balanced per emotion
+actor diversity enforced
+## 6. Safe long-run execution
+resume-safe (skips completed files)
+retry logic (3 attempts)
+failure tracking
+## 7. Data integrity
+WAV validation
+rejects silent/corrupt outputs
+## 8. Research-grade logging
+CSV metadata
+JSON failure log
+reproducible job list
+## 9. GPU efficiency
+no redundant recomputation
+sequential stable inference (safe for TTS models)
